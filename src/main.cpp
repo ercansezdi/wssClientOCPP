@@ -6,82 +6,88 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
-
-byte mac[] = {
-  0x00, 0xAA, 0xBB, 0xCC, 0xDE, 0x02
-};
-void printIPAddress()
-{
-  Serial.print("My IP address: ");
-  for (byte thisByte = 0; thisByte < 4; thisByte++) {
-    Serial.print(Ethernet.localIP()[thisByte], DEC);
-    Serial.print(".");
-  }
-
-  Serial.println();
-}
+#include <pgmspace.h>
 
 WiFiMulti WiFiMulti;
 WebSocketsClient webSocket;
 
-#define USE_SERIAL Serial
+enum states { available, occupied, reserved, unavailable};
+enum error_codes {no_cable , no_error, missing_param, unknown_connector_id , unknown_connector_type, unknown_evse};
+enum transactionEvent  {ended, started, updated};
+enum ChargingStateType  {charging, ev_connected, suspended_ev, suspended_evse, idle};
+enum TriggerReasonType  {authorized, cable_plugged_in, ev_communication_lost, ev_connect_timeout, trigger, remote_stop, remote_start, reset_command, stop_authorized,abnormal_condition};
+bool waitAnswers[2] = {false,false}; //bootNotification
+String getStringFromEnumStates(states e);
+String getStringFromEnumError(error_codes e);
+String getStringFromEnumTransactionEvent(transactionEvent e);
+String getStringFromEnumTransactionTriggerReason(TriggerReasonType e);
+String getStringFromEnumTransactionChargingState(ChargingStateType e);
+void bootNotification(String chargePointModel,String chargePointVendor );
+String get_unique_text();
+char *  create_timestamp();
+void heartbeat();
+void againConnect();
+char timestamp[20];
+unsigned long currenttime=millis();
+unsigned long heartBeatTimeSetter=millis();
+unsigned long heartbeatTime = 120*1000;
 
-void hexdump(const void *mem, uint32_t len, uint8_t cols = 16) {
-	const uint8_t* src = (const uint8_t*) mem;
-	USE_SERIAL.printf("\n[HEXDUMP] Address: 0x%08X len: 0x%X (%d)", (ptrdiff_t)src, len, len);
-	for(uint32_t i = 0; i < len; i++) {
-		if(i % cols == 0) {
-			USE_SERIAL.printf("\n[0x%08X] 0x%08X: ", (ptrdiff_t)src, i);
-		}
-		USE_SERIAL.printf("%02X ", *src);
-		src++;
-	}
-	USE_SERIAL.printf("\n");
-}
-
-
+String DEVICEID = "100100";
 constexpr auto kBufferSize = 900;
 char message[kBufferSize] {};
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  USE_SERIAL.printf("[WSc] Connected to url: %s\n",  payload);
+String stringMessage;
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) 
+{
+    //Serial.printf("[WSc][ALL] Receive Message : %s\n",  payload);
 
     switch(type) {
         case WStype_DISCONNECTED:
-            USE_SERIAL.printf("[WSc] Disconnected!\n");
+        {
+            Serial.printf("[WSc] Disconnected!\n");
+            webSocket.disconnect();
+            //while(!webSocket.isConnected())
+            //{
+            //delay(10);}
             break;
+        }
         case WStype_CONNECTED:
-            {
-                USE_SERIAL.printf("[WSc] Connected to url: %s\n",  payload);
-
-			    // send message to server when Connected
-				    DynamicJsonDocument doc(256);
-
-            doc.add(2);
-            doc.add("5e029f64-6665-45fb-82ad-79a6e7a1c56f");
-            doc.add("BootNotification");
-            JsonObject doc_3 = doc.createNestedObject();
-            doc_3["chargePointModel"] = "esp32_ocpp_ercan";
-            doc_3["chargePointVendor"] = "125464145";
-
-            serializeJson(doc, message);
-            String ser = String(message);
-            webSocket.sendTXT(ser);
-            break;
-            }
+        {
+            bootNotification("Ercan","Sezdi");
+            waitAnswers[0] = true;
+          break;
+        }
             
         case WStype_TEXT:
-            USE_SERIAL.printf("[WSc] get text: %s\n", payload);
+        {
+          Serial.print("[WSc][ANSWER] Receive Message :");
+          Serial.printf("%s\n",payload);
+          if(waitAnswers[0])
+          {
+            StaticJsonDocument<192> doc;
 
-			// send message to server
-			// webSocket.sendTXT("message here");
-            break;
-        case WStype_BIN:
-            USE_SERIAL.printf("[WSc] get binary length: %u\n", length);
-            hexdump(payload, length);
+            DeserializationError error = deserializeJson(doc, payload);
 
-            // send data to server
-            // webSocket.sendBIN(payload, length);
-            break;
+            if (error) {
+              Serial.print(F("deserializeJson() failed: "));
+              Serial.println(error.f_str());
+            }
+            JsonObject root_2 = doc[2];
+            const char* root_2_currentTime = root_2["currentTime"]; // "2022-11-15T12:49:12Z"
+            int root_2_interval = root_2["interval"]; // 60
+            heartbeatTime = root_2_interval*1000;
+            const char* root_2_status = root_2["status"]; // "Accepted
+            if(root_2_status == "Rejected")
+            {
+              while(true)
+              {
+                ;
+              }
+            }
+            waitAnswers[0] = false;
+          }
+          break;
+        }
+
 		case WStype_ERROR:			
 		case WStype_FRAGMENT_TEXT_START:
 		case WStype_FRAGMENT_BIN_START:
@@ -92,130 +98,249 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 }
 
-bool messageSend = true;
 void setup() {
-    // USE_SERIAL.begin(921600);
-    USE_SERIAL.begin(115200);
+    Serial.begin(115200);
 
-    //Serial.setDebugOutput(true);
-    USE_SERIAL.setDebugOutput(true);
-
-    USE_SERIAL.println();
-    USE_SERIAL.println();
-    USE_SERIAL.println();
-
-      for(uint8_t t = 4; t > 0; t--) {
-          USE_SERIAL.printf("[SETUP] BOOT WAIT %d...\n", t);
-          USE_SERIAL.flush();
-          delay(50);
-      }
 
     WiFiMulti.addAP("YAZILIM", "1234567890");
-
-    //WiFi.disconnect();
     while(WiFiMulti.run() != WL_CONNECTED) {
         delay(100);
     }
-    const char cert[]  = \
-    "-----BEGIN PRIVATE KEY-----\n" \
-    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC3anTLUhxh1oqU\n" \
-    "v5bMzDiwDKTLyJmYzL6SQ8tKxc/s/XlBoATc5wbGCmAS+gin1ea1RWtJGpIE/A4y\n" \
-    "cxDMmkDXf/IY9GApSjFBvalZrORdPi6LsYA+GC5aNn4lxU/UdtgzqhB0NupegQlx\n" \
-    "GTBM6QSUTOa6UIvmHfstTE+lOq4BqNfKLvnT3MoGxcpMa1PrIgrZgHwnyyLV8zxB\n" \
-    "Ef6lqWOPcxUgnk0mHQoXMlCk4atw3TMo8uG9JljDzIbco7oLKInO48YmzzOXnQPa\n" \
-    "EuDMThKyMrqiZhwAk8ZAkYnnE+GUUqPs2LPqQhFoWTZ0MKRRCXEDNJNHbuv1qyj8\n" \
-    "tiHd2tK5AgMBAAECggEAFYTt1k+IUTHP0U8vsRBKW9xl5tteqwLlnolJ9BhEkop0\n" \
-    "NC8DNww7exeLSVqw0ok5/91YzqtJg8BzZXei2lCESExkgglE8X85C3ymPoVWhzqV\n" \
-    "ETJ2iIKDiLXRQ9r0KGo3qEsdEleBlKwoyI5TIIjrzr79iJFL8qgkmL5V7120vfCn\n" \
-    "e+s1/6bnScnA69f5a2es0qN8olWzH7mLdHKpipM89C/k8dvHnoifPEn/JNzToriI\n" \
-    "fGuZbuX/KJk9wL3heF8Tbs28oXS76iSv8ZRmtPxvYl9YIAwIZgG8Wx4AFsFMFpr9\n" \
-    "MBEGP7w1lHNA+cdhayyKFNyXSX0WApyIfjL9xv4B0QKBgQDqlFk8hAUaK8s7KMhQ\n" \
-    "Rgd59LHmpFUSJin8189mag8FER31e/ShcnOBBXfG9s9GuV+gpArJMG+inTwr7WPb\n" \
-    "Q5OsZ42yBH2IHiAIc/BUXEqCfJMGOQiVidQ1/rgp1ditqWPsc2zp4cQ9vPvJ7b8d\n" \
-    "US6gh3UNsT/ArvWUzf/bqv53KQKBgQDIKhRzeZrAxDNDklNN6SUQBiC9ZabzPJaU\n" \
-    "wX9KIVVO/DipTwgzZ7YLgCXndfKl2r0k4mJmu1owvUNfWcj97hagI4gwHo+zT54u\n" \
-    "bN6ft+lIPjkBiTwVXiTV00bmmEQrD4YghLrOPYemhqsSVu4BldYWJDRpS/oGHjGI\n" \
-    "QWxzQQfBEQKBgQDBBuGHUnuAVZkeTSjIJVfxmtDpIUB/drgGPu+DLrK9UKB+aEmc\n" \
-    "sDkrafxt1JorcE6oOVRGyXyTKx9gZi9NNgZGT8/hNKC3aVKiogSY5njJdwjkjfnq\n" \
-    "U0g0Ri30/usVu9VltHVi30xEIUZvmxswXKUpo01Gvxveyhl7ISfw8nwCQQKBgEOs\n" \
-    "5ok8XjQ6odKA0KWQ5DUMvVkL22x12bulyHG532v7HvUvgWhP8l7lDuu5Fzc4Q6cK\n" \
-    "25Y8VfwQoYzFgI1KSGAQY2VRj+hiTOsJaCO8PKVuVDvOuH/I+s9IxboFVVbxwrmP\n" \
-    "5tEAQLLu6TwkJAhpLp8B0q6fP4N+BeU5qX82R3bhAoGBAK2W4+8ZR6D0vUTPH25+\n" \
-    "5ZO3dsQwcQHllLhgd+vn0TFiNh9lS+l1GNZGUkez3w6nZD/UaphNhAwLYP4vrPxZ\n" \
-    "6hgHrf5CPh0fC1XQ9rf10/wpFDDe2Si/O+4rxKt47QrMSIda3vzrpMm29fv2soLs\n" \
-    "u0TclhfR8G8IfA8Lpo7PixmN\n" \
-    "-----END PRIVATE KEY-----\n" \
-    "-----BEGIN CERTIFICATE-----\n" \
-    "MIIDazCCAlOgAwIBAgIUTDPFT+rr2IgZV1MmXATYSrooeDcwDQYJKoZIhvcNAQEL\n" \
-    "BQAwRTELMAkGA1UEBhMCVFIxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM\n" \
-    "GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yMjExMDkwOTE2NThaFw0yMzEx\n" \
-    "MDkwOTE2NThaMEUxCzAJBgNVBAYTAlRSMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw\n" \
-    "HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggEiMA0GCSqGSIb3DQEB\n" \
-    "AQUAA4IBDwAwggEKAoIBAQC3anTLUhxh1oqUv5bMzDiwDKTLyJmYzL6SQ8tKxc/s\n" \
-    "/XlBoATc5wbGCmAS+gin1ea1RWtJGpIE/A4ycxDMmkDXf/IY9GApSjFBvalZrORd\n" \
-    "Pi6LsYA+GC5aNn4lxU/UdtgzqhB0NupegQlxGTBM6QSUTOa6UIvmHfstTE+lOq4B\n" \
-    "qNfKLvnT3MoGxcpMa1PrIgrZgHwnyyLV8zxBEf6lqWOPcxUgnk0mHQoXMlCk4atw\n" \
-    "3TMo8uG9JljDzIbco7oLKInO48YmzzOXnQPaEuDMThKyMrqiZhwAk8ZAkYnnE+GU\n" \
-    "UqPs2LPqQhFoWTZ0MKRRCXEDNJNHbuv1qyj8tiHd2tK5AgMBAAGjUzBRMB0GA1Ud\n" \
-    "DgQWBBRLk0KTpEny3sXC3lb7YJGdau/PNjAfBgNVHSMEGDAWgBRLk0KTpEny3sXC\n" \
-    "3lb7YJGdau/PNjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBT\n" \
-    "J97PlQPsDBPim7QojMSrRxwHXiR8uxVLOm4F4B0BPIBAnMIFaWxNp366H56oSZ7Z\n" \
-    "HSuqHbHbTtlmhM+VDue0F4fFP7eG8xtUQ37dpHi0qBTe4gUcKHjGstcrcqnaBf68\n" \
-    "iHHiY07pYjOZ1YQfs/FB5BsBIp9l670ZXIf1plmnWMjH0pMIYtGo0p3E6txzDTka\n" \
-    "06Sw2b/mAtvgJZuOHrH6kVgrIyogZdaAlx1y0CjZbRPgRfXCtKorXM9VZYXk+bGh\n" \
-    "2BchWPfssoE2ugHpjrWn5p1XM7c40PWLJK6XKd1eRO2Y74V4se7us+Lq0kPtm6wx\n" \
-    "55++Lbe3KkRNFSG7tFZC\n" \
-    "-----END CERTIFICATE-----\n";
 
-    //webSocket.beginSSL("192.168.1.164", 9000);
-    webSocket.beginSslWithCA("192.168.1.164",9000,"/100100",NULL,"ocpp1.6");
-    //webSocket.setExtraHeaders();
-    //webSocket.setAuthorization();
+    const char cert[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDazCCAlOgAwIBAgIUTDPFT+rr2IgZV1MmXATYSrooeDcwDQYJKoZIhvcNAQEL
+BQAwRTELMAkGA1UEBhMCVFIxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM
+GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yMjExMDkwOTE2NThaFw0yMzEx
+MDkwOTE2NThaMEUxCzAJBgNVBAYTAlRSMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw
+HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQC3anTLUhxh1oqUv5bMzDiwDKTLyJmYzL6SQ8tKxc/s
+/XlBoATc5wbGCmAS+gin1ea1RWtJGpIE/A4ycxDMmkDXf/IY9GApSjFBvalZrORd
+Pi6LsYA+GC5aNn4lxU/UdtgzqhB0NupegQlxGTBM6QSUTOa6UIvmHfstTE+lOq4B
+qNfKLvnT3MoGxcpMa1PrIgrZgHwnyyLV8zxBEf6lqWOPcxUgnk0mHQoXMlCk4atw
+3TMo8uG9JljDzIbco7oLKInO48YmzzOXnQPaEuDMThKyMrqiZhwAk8ZAkYnnE+GU
+UqPs2LPqQhFoWTZ0MKRRCXEDNJNHbuv1qyj8tiHd2tK5AgMBAAGjUzBRMB0GA1Ud
+DgQWBBRLk0KTpEny3sXC3lb7YJGdau/PNjAfBgNVHSMEGDAWgBRLk0KTpEny3sXC
+3lb7YJGdau/PNjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBT
+J97PlQPsDBPim7QojMSrRxwHXiR8uxVLOm4F4B0BPIBAnMIFaWxNp366H56oSZ7Z
+HSuqHbHbTtlmhM+VDue0F4fFP7eG8xtUQ37dpHi0qBTe4gUcKHjGstcrcqnaBf68
+iHHiY07pYjOZ1YQfs/FB5BsBIp9l670ZXIf1plmnWMjH0pMIYtGo0p3E6txzDTka
+06Sw2b/mAtvgJZuOHrH6kVgrIyogZdaAlx1y0CjZbRPgRfXCtKorXM9VZYXk+bGh
+2BchWPfssoE2ugHpjrWn5p1XM7c40PWLJK6XKd1eRO2Y74V4se7us+Lq0kPtm6wx
+55++Lbe3KkRNFSG7tFZC
+-----END CERTIFICATE-----
+)EOF";
+
+    webSocket.beginSslWithCA("192.168.1.164",9000,"/100100",NULL,"ocpp2.0.1");
+    webSocket.setAuthorization("100100","123qweASDzxc");
 
 
     webSocket.onEvent(webSocketEvent);
 
 }
 
-void loop() {
-  webSocket.loop();
-}
-
-
-
-/*#include <SPI.h>
-#include <WiFi.h>
- #include <WiFiClientSecure.h>
-byte mac[] = {
-  0x00, 0xAA, 0xBB, 0xCC, 0xDE, 0x02
-};
-void printIPAddress()
+void loop() 
 {
-  Serial.print("My IP address: ");
-  for (byte thisByte = 0; thisByte < 4; thisByte++) {
-    Serial.print(Ethernet.localIP()[thisByte], DEC);
-    Serial.print(".");
-  }
-
-  Serial.println();
-}
-void setup() {
-  Serial.begin(115200);
-  Ethernet.init(5);
-  while (!Serial) {
-    ; 
-  }
-
-  if (Ethernet.begin(mac) == 0) 
+  currenttime=millis();
+  if(currenttime - heartBeatTimeSetter > heartbeatTime) 
   {
-    Serial.println("Failed to configure Ethernet using DHCP");
-    for (;;)
-      ;
+    heartBeatTimeSetter = millis();
+    heartbeat();
   }
-  printIPAddress();
+  if(webSocket.isConnected())
+  {againConnect();}
+  webSocket.loop();
+
+}
+void againConnect()
+{
+  webSocket.beginSslWithCA("192.168.1.164",9000,"/100100",NULL,"ocpp2.0.1");
+    webSocket.setAuthorization("100100","123qweASDzxc");
+
+
+    webSocket.onEvent(webSocketEvent);
+
+
 }
 
-void loop() {
+void bootNotification(String chargePointModel,String chargePointVendor )
+{
+  DynamicJsonDocument doc(256);
+  doc.add(2);
+    doc.add(get_unique_text());
+    doc.add("BootNotification");
+    JsonObject doc_3 = doc.createNestedObject();
+    JsonObject doc_3_chargingStation = doc_3.createNestedObject("chargingStation");
+    doc_3_chargingStation["model"] = chargePointModel;
+    doc_3_chargingStation["vendorName"] = chargePointVendor;
+    doc_3["reason"] = "Unknown";
+
+  serializeJson(doc, message);
+  stringMessage = String(message);
+  webSocket.sendTXT(stringMessage);
 }
 
-*/
+void heartbeat()
+  {
+    DynamicJsonDocument doc(128);
+    doc.add(2);
+    doc.add(get_unique_text());
+    doc.add("Heartbeat");
+    JsonObject doc_3 = doc.createNestedObject();
+    serializeJson(doc, message);
+    stringMessage = String(message);
+    webSocket.sendTXT(stringMessage);
+  }
+void authorize(String idTag) 
+  {
+    DynamicJsonDocument doc(256);
+    doc.add(2);
+    doc.add(get_unique_text());
+    doc.add("Authorize");
+    JsonObject doc_3_idToken = doc[3].createNestedObject("idToken");
+    JsonObject doc_3_idToken_additionalInfo_0 = doc_3_idToken["additionalInfo"].createNestedObject();
+    doc_3_idToken_additionalInfo_0["additionalIdToken"] = idTag;
+    doc_3_idToken_additionalInfo_0["type"] = "VID";
+    doc_3_idToken["idToken"] = idTag;
+    doc_3_idToken["type"] = "MacAddress";
+    serializeJson(doc, message);
+    stringMessage = String(message);
+    webSocket.sendTXT(stringMessage);
+  }
+void statusNotification(int connectorID, states status, error_codes error, int evseId) 
+  {
+    DynamicJsonDocument doc(256);
+
+    doc.add(2);
+    doc.add(get_unique_text());
+    doc.add("StatusNotification");
+    JsonObject doc_3 = doc.createNestedObject();
+    doc_3["connectorId"] = connectorID;
+    doc_3["connectorStatus"] = getStringFromEnumStates(status);
+    doc_3["evseId"] = evseId;
+    doc_3["timestamp"] = create_timestamp();
+    serializeJson(doc, message);
+    stringMessage = String(message);
+    webSocket.sendTXT(stringMessage);
+  }
+char *  create_timestamp()
+  {
+    
+    sprintf (timestamp, "%4d-%02d-%02dT%02d:%02d:%02dZ", "1996", "11", "05", "09", "09", "09");
+    return timestamp;
+  }
+
+String getStringFromEnumTransactionChargingState(ChargingStateType e)
+{
+  switch (e)
+  {
+    case charging: return "Charging";
+    case ev_connected: return "EVConnected";
+    case suspended_ev: return "SuspendedEV";
+    case suspended_evse: return "SuspendedEVSE";
+    case idle: return "Idle";
+    default: return "SG";
+  }
+}
+
+String getStringFromEnumTransactionTriggerReason(TriggerReasonType e)
+{
+  switch (e)
+  {
+    case authorized: return "Authorized";
+    case cable_plugged_in: return "CablePluggedIn";
+    case ev_communication_lost: return "EVCommunicationLost";
+    case ev_connect_timeout: return "EVConnectTimeout";
+    case remote_stop: return "RemoteStop";
+    case remote_start: return "RemoteStart";
+    case reset_command: return "ResetCommand";
+    case stop_authorized: return "StopAuthorized";
+    case abnormal_condition: return "AbnormalCondition";
+    default: return "SG";
+  }
+}
+
+String getStringFromEnumTransactionEvent(transactionEvent e)
+{
+  switch (e)
+  {
+    case ended: return "Ended";
+    case started: return "Started";
+    case updated: return "Updated";
+    default: return "SG";
+  }
+}
+
+String  getStringFromEnumStates(states e)
+{
+  switch (e)
+  {
+    case available: return "Available";
+    case occupied: return "Occupied";
+    case reserved: return "Reserved";
+    case unavailable: return "Unavailable";
+    default: return "Faulted";
+  }
+}
+
+String getStringFromEnumError(error_codes e)
+{
+  switch (e)
+  {
+    case no_cable: return "NoCable";
+    case no_error: return "NoError";
+    case missing_param: return "MissingParam";
+    case unknown_connector_id: return "UnknownConnectorId";
+    case unknown_connector_type: return "UnknownConnectorType";
+    case unknown_evse: return "UnknownEvse";
+    default: return "SG";
+  }
+}
+
+String get_unique_text()
+{
+  //randomSeed(analogRead(A3));
+  bool exit2 = true;
+  bool exit1 = true;
+  String uniq_kod = "";
+  String  randString;
+  String oldKey  = "";
+  char letters[36] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0'};
+  int j;
+  int uniqKeyLenght[5] = {2, 4, 4, 4, 12};
+
+  while (exit1)
+  {
+    uniq_kod = "";
+    uniq_kod += DEVICEID;
+    j = 0;
+    for ( j = 0 ; j < 5 ; j++)
+    {
+      randString = "";
+      exit2 = true;
+      while (exit2)
+      {
+        randString = randString + letters[random(0, 36)];
+        if (randString.length() >= uniqKeyLenght[j])
+        {
+          uniq_kod = uniq_kod + randString;
+          exit2 = false;
+        }
+      }
+      if (j != 4)
+        uniq_kod = uniq_kod + "-";
+    }
+    if (oldKey != uniq_kod)
+    {
+      oldKey = uniq_kod;
+      exit1 = false;
+    }
+    else
+    {
+      uniq_kod = "";
+      uniq_kod += DEVICEID;
+    }
+  }
+  return uniq_kod;
+
+}
